@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+# gridfinity_inner.py – Generate Gridfinity bins, solid inserts, and
+#                       image-shaped cut-outs that drop neatly inside.
+#
+#   • Each helper is tiny; no duplicated logic
+#   • Comments live above functions (no doc-strings)
+#   • Real tests run automatically when the file is imported
+#
+# Requires:
+#   build123d ≥ 0.9
+#   gfthings  (master branch)
+#   opencv-python for --cutout
+
+# ---------------------------------------------------------------------------#
+# imports                                                                    #
+# ---------------------------------------------------------------------------#
+import argparse
+from pathlib import Path
+from typing import List, Tuple
+
+from build123d import export_stl  # STL helper
+from gfthings.Bin import FunkyBin  # Gridfinity bin generator
+
+# ---------------------------------------------------------------------------#
+# constants                                                                  #
+# ---------------------------------------------------------------------------#
+TOLERANCE_MM = 0.30  # wall clearance for the inner plug
+TOP_GAP_MM = 1.0  # gap above plug so you can pull it out
+MIN_HOLE_MM = 0.75  # fill gaps narrower than this when tracing
+DEFAULT_PPMM = 10  # default pixels-per-millimetre for --cutout
+
+
+# ---------------------------------------------------------------------------#
+# parse_shape – convert CLI tokens into a binary matrix                      #
+# ---------------------------------------------------------------------------#
+def parse_shape(tokens: List[str]) -> Tuple[List[List[int]], str]:
+    if len(tokens) == 2 and all(t.isdigit() for t in tokens):
+        cols, rows = map(int, tokens)
+        matrix = [[1] * cols for _ in range(rows)]
+    else:
+        matrix = [[1 if c == "1" else 0 for c in row.strip()] for row in tokens]
+        cols = max(len(r) for r in matrix)
+        rows = len(matrix)
+    return matrix, f"gridfinity_{cols}x{rows}"
+
+
+# ---------------------------------------------------------------------------#
+# image_to_contour – trace the largest blob inside a 1 cm-grid photo         #
+# ---------------------------------------------------------------------------#
+def image_to_contour(
+    image_path: Path,
+    ppmm: int = DEFAULT_PPMM,
+    tol_mm: float = 0.50,
+    min_hole_mm: float = MIN_HOLE_MM,
+    debug: bool = True,
+) -> List[Tuple[float, float]]:
+    import cv2
+    import numpy as np
+
+    # Load the image
+    img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(image_path)
+
+    print(f"Loaded image: {image_path}, dimensions: {img.shape}")
+
+    # Save original for debug overlay
+    original = img.copy()
+    debug_color = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
+
+    # Step 1: Detect the grid lines
+    # Apply adaptive thresholding to isolate the grid
+    grid_thresh = cv2.adaptiveThreshold(
+        img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # Use Hough Line Transform to detect grid lines
+    lines = cv2.HoughLinesP(
+        grid_thresh,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=img.shape[0] // 4,  # Lines should be at least 1/4 of the image
+        maxLineGap=20,
+    )
+
+    if lines is None or len(lines) < 4:  # Need at least a few lines to form a grid
+        print("ERROR: Could not detect grid lines properly")
+        if debug:
+            cv2.imwrite(
+                str(
+                    image_path.with_name(
+                        f"{image_path.stem}_grid_thresh{image_path.suffix}"
+                    )
+                ),
+                grid_thresh,
+            )
+        raise RuntimeError("Grid detection failed - not enough lines detected")
+
+    # Step 2: Separate horizontal and vertical lines
+    h_lines = []
+    v_lines = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        # Calculate angle to determine if horizontal or vertical
+        angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+
+        if angle < 45 or angle > 135:  # Horizontal line
+            h_lines.append(line[0])
+            if debug:
+                cv2.line(debug_color, (x1, y1), (x2, y2), (0, 255, 0), 1)  # Green
+        elif angle >= 45 and angle <= 135:  # Vertical line
+            v_lines.append(line[0])
+            if debug:
+                cv2.line(debug_color, (x1, y1), (x2, y2), (255, 0, 0), 1)  # Blue
+
+    print(f"Detected {len(h_lines)} horizontal and {len(v_lines)} vertical grid lines")
+
+    if debug:
+        cv2.imwrite(
+            str(
+                image_path.with_name(f"{image_path.stem}_grid_lines{image_path.suffix}")
+            ),
+            debug_color,
+        )
+
+    # Step 3: Find the object (content) in the image
+    # Use binary thresholding to separate object from background
+    _, obj_thresh = cv2.threshold(img, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # Apply morphological operations to clean up the object mask
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (max(1, int(min_hole_mm * ppmm)),) * 2
+    )
+    obj_mask = cv2.morphologyEx(obj_thresh, cv2.MORPH_CLOSE, kernel)
+    obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN, kernel)
+
+    if debug:
+        cv2.imwrite(
+            str(image_path.with_name(f"{image_path.stem}_object{image_path.suffix}")),
+            obj_mask,
+        )
+
+    # Step 4: Find intersections between the grid lines and the object
+    intersection_points = []
+
+    # Function to check if a point is on the boundary of the object
+    def is_boundary_point(x, y, mask, window_size=3):
+        # Get a small window around the point
+        x_start = max(0, x - window_size // 2)
+        x_end = min(mask.shape[1], x + window_size // 2 + 1)
+        y_start = max(0, y - window_size // 2)
+        y_end = min(mask.shape[0], y + window_size // 2 + 1)
+
+        window = mask[y_start:y_end, x_start:x_end]
+
+        # Check if the window contains both object and background pixels
+        return np.min(window) == 0 and np.max(window) == 255
+
+    # Sample points along each grid line and check for intersections
+    for line in h_lines + v_lines:
+        x1, y1, x2, y2 = line
+        # Create a set of points along the line
+        if abs(x2 - x1) > abs(y2 - y1):  # Horizontal-ish line
+            for x in range(min(x1, x2), max(x1, x2) + 1, 5):  # Sample every 5 pixels
+                y = int(y1 + (y2 - y1) * (x - x1) / (x2 - x1)) if x2 != x1 else y1
+                if 0 <= y < obj_mask.shape[0] and is_boundary_point(x, y, obj_mask):
+                    intersection_points.append((x, y))
+                    if debug:
+                        cv2.circle(debug_color, (x, y), 3, (0, 0, 255), -1)  # Red
+        else:  # Vertical-ish line
+            for y in range(min(y1, y2), max(y1, y2) + 1, 5):
+                x = int(x1 + (x2 - x1) * (y - y1) / (y2 - y1)) if y2 != y1 else x1
+                if 0 <= x < obj_mask.shape[1] and is_boundary_point(x, y, obj_mask):
+                    intersection_points.append((x, y))
+                    if debug:
+                        cv2.circle(debug_color, (x, y), 3, (0, 0, 255), -1)  # Red
+
+    print(f"Found {len(intersection_points)} grid-object intersection points")
+
+    if len(intersection_points) < 3:
+        print("ERROR: Too few intersection points found")
+        cv2.imwrite(
+            str(
+                image_path.with_name(
+                    f"{image_path.stem}_intersections{image_path.suffix}"
+                )
+            ),
+            debug_color,
+        )
+        raise RuntimeError("Not enough intersection points to form a contour")
+
+    # Step 5: Order the points to form a contour around the object
+    # Convert to numpy array for easier manipulation
+    points = np.array(intersection_points)
+
+    # Find the center of the points
+    center = np.mean(points, axis=0)
+
+    # Sort points by angle around the center
+    def polar_angle(point):
+        return np.arctan2(point[1] - center[1], point[0] - center[0])
+
+    sorted_indices = sorted(range(len(points)), key=lambda i: polar_angle(points[i]))
+    ordered_points = points[sorted_indices]
+
+    # Apply polygon approximation to reduce number of points
+    epsilon = tol_mm * ppmm
+    contour = cv2.approxPolyDP(ordered_points.reshape((-1, 1, 2)), epsilon, True)
+    contour = contour.reshape((-1, 2))
+
+    if debug:
+        # Draw the final contour
+        contour_img = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
+        cv2.polylines(contour_img, [contour], True, (0, 0, 255), 2)
+        cv2.imwrite(
+            str(
+                image_path.with_name(
+                    f"{image_path.stem}_final_contour{image_path.suffix}"
+                )
+            ),
+            contour_img,
+        )
+
+        # Also draw on the debug image with grid lines
+        cv2.polylines(debug_color, [contour], True, (0, 255, 255), 2)  # Yellow
+        cv2.imwrite(
+            str(
+                image_path.with_name(
+                    f"{image_path.stem}_grid_and_contour{image_path.suffix}"
+                )
+            ),
+            debug_color,
+        )
+
+    # Convert to mm and center
+    pts_mm = contour / ppmm
+    cx, cy = pts_mm.mean(axis=0)
+    centered_pts = [(float(x - cx), float(y - cy)) for x, y in pts_mm]
+
+    print(f"Final contour has {len(centered_pts)} points")
+    print(f"Contour centered at ({cx:.2f}, {cy:.2f}) mm")
+
+    return centered_pts
+
+
+# ---------------------------------------------------------------------------#
+# gridfinity_inner – solid insert that fits the bin precisely                #
+# ---------------------------------------------------------------------------#
+def gridfinity_inner(
+    shape: List[List[int]],
+    height_units: int = 3,
+    tol: float = TOLERANCE_MM,
+    top_gap: float = TOP_GAP_MM,
+):
+    from build123d import (
+        BuildPart,
+        BuildSketch,
+        RectangleRounded,
+        Plane,
+        Align,
+        extrude,
+    )
+    from gfthings.parameters import bin_size, bin_clearance, outer_rad, plate_height
+
+    try:
+        from gfthings.parameters import wall_thickness as WALL
+    except ImportError:
+        WALL = 1.2
+
+    cols = max(len(r) for r in shape)
+    rows = len(shape)
+    inner_w = cols * bin_size - 2 * (bin_clearance + WALL + tol)
+    inner_d = rows * bin_size - 2 * (bin_clearance + WALL + tol)
+    inner_r = max(outer_rad - bin_clearance - WALL - tol, 0)
+    inner_h = height_units * 7 - plate_height - top_gap
+
+    print(f"Creating insert: {cols}x{rows} grid, height {height_units} units")
+    print(
+        f"Insert dimensions: {inner_w:.2f}x{inner_d:.2f}x{inner_h:.2f} mm, corner radius: {inner_r:.2f} mm"
+    )
+
+    with BuildPart() as plug:
+        with BuildSketch(Plane.XY):
+            RectangleRounded(
+                inner_w, inner_d, inner_r, align=(Align.CENTER, Align.CENTER)
+            )
+        extrude(amount=inner_h)
+
+    print(f"Insert created successfully with volume: {plug.part.volume:.2f} mm³")
+    return plug.part
+
+
+# ---------------------------------------------------------------------------#
+# carve_plug – subtract a 2-D contour from the plug                          #
+# ---------------------------------------------------------------------------#
+def carve_plug(
+    plug_part,
+    contour_mm: List[Tuple[float, float]],
+    depth_mm: float,
+    debug: bool = True,
+    cutout_name: str = "",
+):
+    from build123d import Solid, Face, Wire, Edge, Vector
+
+    print(f"\nCarving cutout with depth: {depth_mm:.2f} mm")
+    print(f"Contour has {len(contour_mm)} points")
+
+    # Create 3D points
+    points_3d = [Vector(float(x), float(y), 0) for x, y in contour_mm]
+
+    # Ensure the contour is closed
+    if (points_3d[0].X != points_3d[-1].X) or (points_3d[0].Y != points_3d[-1].Y):
+        print("Closing contour by adding first point to the end")
+        points_3d.append(points_3d[0])
+
+    # Create edges connecting the points
+    edges = []
+    for i in range(len(points_3d) - 1):
+        try:
+            edge = Edge.make_line(points_3d[i], points_3d[i + 1])
+            edges.append(edge)
+        except Exception as e:
+            print(f"Error creating edge {i} → {i+1}: {e}")
+
+    print(f"Created {len(edges)} edges")
+
+    if len(edges) < 3:
+        print("ERROR: Need at least 3 edges to form a wire")
+        return plug_part
+
+    # Create a wire using combine
+    try:
+        wire_result = Wire.combine(edges)
+        if not wire_result:
+            print("ERROR: Wire.combine returned empty result")
+            return plug_part
+
+        wire = wire_result[0]
+        print(f"Wire created successfully, length: {wire.length:.2f} mm")
+
+        if not wire.is_closed:
+            print("WARNING: Wire is not closed!")
+    except Exception as e:
+        print(f"ERROR creating wire: {e}")
+        return plug_part
+
+    # Create a face from the wire
+    try:
+        face = Face(wire)
+        print(f"Face created successfully, area: {face.area:.2f} mm²")
+    except Exception as e:
+        print(f"ERROR creating face: {e}")
+        return plug_part
+
+    # Create a solid by extruding the face
+    try:
+        extrude_dir = Vector(0, 0, depth_mm)
+        cutter = Solid.extrude(face, extrude_dir)
+        print(f"Cutter created successfully, volume: {cutter.volume:.2f} mm³")
+    except Exception as e:
+        print(f"ERROR creating cutter: {e}")
+        return plug_part
+
+    # Perform the boolean operation
+    try:
+        original_volume = plug_part.volume
+        result = plug_part - cutter
+        new_volume = result.volume
+        volume_diff = original_volume - new_volume
+
+        print(f"Boolean subtraction completed:")
+        print(f"  Original volume: {original_volume:.2f} mm³")
+        print(f"  New volume: {new_volume:.2f} mm³")
+        print(
+            f"  Volume removed: {volume_diff:.2f} mm³ ({100*volume_diff/original_volume:.2f}%)"
+        )
+
+        if volume_diff <= 0:
+            print("WARNING: No volume was removed! The cutout operation failed.")
+    except Exception as e:
+        print(f"ERROR during boolean operation: {e}")
+        return plug_part
+
+    # Clean up the result
+    try:
+        result.clean()
+        print("Clean operation completed")
+    except Exception as e:
+        print(f"Warning during clean operation: {e}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------#
+# main – CLI                                                                 #
+# ---------------------------------------------------------------------------#
+def main():
+    cli = argparse.ArgumentParser(
+        description="Generate Gridfinity bin STL, inner plug, or image-carved insert."
+    )
+    cli.add_argument(
+        "shape",
+        nargs="+",
+        help="Two ints (cols rows) or binary rows; ignored with --cutout",
+    )
+    cli.add_argument("--height", type=int, default=3, help="Height units (default 3)")
+    cli.add_argument(
+        "--inner", action="store_true", help="Export solid insert instead of bin"
+    )
+    cli.add_argument(
+        "--cutout",
+        type=Path,
+        metavar="IMAGE",
+        help="Image of shape on a 1 cm grid to carve out of insert",
+    )
+    cli.add_argument(
+        "--ppmm",
+        type=int,
+        default=DEFAULT_PPMM,
+        help="Pixels-per-mm if auto-detection fails",
+    )
+    cli.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output and visualizations",
+    )
+    args = cli.parse_args()
+
+    shape, base = parse_shape(args.shape)
+
+    # Modify the filename to include the cutout name if provided
+    if args.cutout:
+        cutout_name = args.cutout.stem
+        outfile = f"{base}x{args.height}_{cutout_name}.stl"
+    else:
+        outfile = f"{base}x{args.height}.stl"
+
+    print(f"\nOutput file will be: {outfile}")
+
+    # Plain bin
+    if not args.inner and not args.cutout:
+        export_stl(FunkyBin(shape, height_units=args.height), outfile)
+        print("Exported bin:", outfile)
+        return
+
+    # Start with solid plug
+    plug = gridfinity_inner(shape, args.height)
+
+    # Optional carve
+    if args.cutout:
+        print(f"\nProcessing cutout image: {args.cutout}")
+        contour = image_to_contour(
+            args.cutout, ppmm=args.ppmm, debug=args.debug or True
+        )
+        from gfthings.parameters import plate_height
+
+        depth = args.height * 7 - plate_height - 2 * TOP_GAP_MM
+        plug = carve_plug(
+            plug, contour, depth, debug=args.debug or True, cutout_name=args.cutout.stem
+        )
+
+    export_stl(plug, outfile)
+    print(f"\nExported: {outfile}")
+
+
+# ---------------------------------------------------------------------------#
+# tests – auto-run when imported                                             #
+# ---------------------------------------------------------------------------#
+if __name__ == "__main__":
+    main()
+else:
+    import unittest
+
+    class GridfinityInnerTests(unittest.TestCase):
+        def test_plug_smaller_than_bin(self):
+            s = [[1, 1], [1, 1]]
+            bin_part = FunkyBin(s, 3)
+            plug_part = gridfinity_inner(s, 3)
+            self.assertLess(plug_part.volume, bin_part.volume)
+
+        def test_carve_reduces_volume(self):
+            s = [[1]]
+            plug = gridfinity_inner(s, 3)
+            contour = [(-5, -5), (5, -5), (0, 5)]
+            carve_plug(plug, contour, 10)
+            self.assertLess(plug.volume, FunkyBin(s, 3).volume)
+
+        def test_top_gap(self):
+            s = [[1]]
+            plug = gridfinity_inner(s, 3)
+            from gfthings.parameters import plate_height
+
+            expected = 3 * 7 - plate_height - TOP_GAP_MM
+            self.assertAlmostEqual(plug.bounding_box().size.Z, expected, delta=0.1)
+
+    unittest.main(verbosity=2, exit=False)
