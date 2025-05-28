@@ -16,10 +16,11 @@
 # ---------------------------------------------------------------------------#
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from build123d import export_stl  # STL helper
 from gfthings.Bin import FunkyBin  # Gridfinity bin generator
+import math
 
 # ---------------------------------------------------------------------------#
 # constants                                                                  #
@@ -28,6 +29,7 @@ TOLERANCE_MM = 0.30  # wall clearance for the inner plug
 TOP_GAP_MM = 1.0  # gap above plug so you can pull it out
 MIN_HOLE_MM = 0.75  # fill gaps narrower than this when tracing
 DEFAULT_PPMM = 10  # default pixels-per-millimetre for --cutout
+MIN_SPACING_MM = 2.0  # minimum space between rectangular cut‑outs
 
 
 # ---------------------------------------------------------------------------#
@@ -42,6 +44,131 @@ def parse_shape(tokens: List[str]) -> Tuple[List[List[int]], str]:
         cols = max(len(r) for r in matrix)
         rows = len(matrix)
     return matrix, f"gridfinity_{cols}x{rows}"
+
+
+# ---------------------------------------------------------------------------#
+# parse_mm – convert CLI dimension strings to float millimetres              #
+# ---------------------------------------------------------------------------#
+def parse_mm(text: str) -> float:
+    if text.lower().endswith("mm"):
+        text = text[:-2]
+    return float(text)
+
+
+# ---------------------------------------------------------------------------#
+# best_grid – choose rows/cols & spacing for rectangular cut‑outs            #
+# ---------------------------------------------------------------------------#
+# Returns: cols, rows, spacing_x, spacing_y
+# spacing_x/Y includes the edge margins, guaranteed ≥ MIN_SPACING_MM
+# Raises RuntimeError if the rectangles cannot fit.
+#
+# If count is None we maximise count; otherwise we guarantee at least that
+# many pockets (might return more – e.g. 4 request could yield 6 because of
+# grid).
+# ---------------------------------------------------------------------------#
+def best_grid(
+    part_w: float,
+    part_h: float,
+    rect_w: float,
+    rect_h: float,
+    min_spacing: float = MIN_SPACING_MM,
+    count: Optional[int] = None,
+) -> Tuple[int, int, float, float]:
+    max_cols = math.floor((part_w + min_spacing) / (rect_w + min_spacing))
+    max_rows = math.floor((part_h + min_spacing) / (rect_h + min_spacing))
+
+    if max_cols == 0 or max_rows == 0:
+        raise RuntimeError("Cut‑outs do not fit even once – part too small")
+
+    best = None  # (total, cols, rows, sx, sy)
+
+    # Iterate rows/cols space – small search space so brute force is fine
+    for rows in range(1, max_rows + 1):
+        for cols in range(1, max_cols + 1):
+            total = rows * cols
+            if count and total < count:
+                continue  # not enough pockets
+            sx = (part_w - cols * rect_w) / (cols + 1)
+            sy = (part_h - rows * rect_h) / (rows + 1)
+            if sx < min_spacing or sy < min_spacing:
+                continue  # spacing too tight
+            # Prefer fewer rows (makes long line) if multiple solutions equal
+            score = (rows, -total)
+            cand = (total, cols, rows, sx, sy, score)
+            if best is None or cand[-1] < best[-1]:
+                best = cand
+
+    if best is None:
+        raise RuntimeError(
+            "Unable to fit requested rectangular cut‑outs with ≥2 mm spacing"
+        )
+
+    _, cols, rows, sx, sy, _ = best
+    return cols, rows, sx, sy
+
+
+# ---------------------------------------------------------------------------#
+# carve_rect_grid – subtract a grid of rectangles from the part              #
+# ---------------------------------------------------------------------------#
+# Each rectangle is centred at Z depth so that 2 mm of material remains.
+# ---------------------------------------------------------------------------#
+
+
+def carve_rect_grid(
+    part,
+    rect_w: float,
+    rect_h: float,
+    count: Optional[int],
+    is_inner: bool,
+):
+    from build123d import BuildPart, BuildSketch, Rectangle, Location, extrude, Plane
+    from gfthings.parameters import plate_height
+
+    bbox = part.bounding_box()
+    part_w = bbox.size.X - 2 * MIN_SPACING_MM  # leave outer 2 mm shell untouched
+    part_h = bbox.size.Y - 2 * MIN_SPACING_MM
+
+    cols, rows, sx, sy = best_grid(
+        part_w, part_h, rect_w, rect_h, MIN_SPACING_MM, count
+    )
+
+    # left/bottom offset so first spacing margin included
+    start_x = bbox.center().X - (cols - 1) * (rect_w + sx) / 2
+    start_y = bbox.center().Y - (rows - 1) * (rect_h + sy) / 2
+
+    # depth calculation
+    depth = bbox.size.Z - 2.0
+    if depth <= 0:
+        raise RuntimeError("Computed depth ≤0 – part too shallow for cut‑out")
+    print(f"Cutter depth: {depth:.2f} mm")
+
+    cutters = []
+    for r in range(rows):
+        cy = start_y + r * (rect_h + sy)
+        for c in range(cols):
+            cx = start_x + c * (rect_w + sx)
+            with BuildPart():
+                z_top = bbox.max.Z
+                with BuildSketch(Plane.XY * Location((cx, cy, z_top))):
+                    Rectangle(rect_w, rect_h, align=(None, None))
+                cut = extrude(amount=-depth)
+                cutters.append(cut)
+
+    # Boolean difference – union cutters then subtract once (faster)
+    from build123d import Compound
+
+    print(f"Total cutters: {len(cutters)}")
+
+    removal = Compound(*cutters)  # build123d ≥ 0.9
+
+    print(f"Cutter volume: {removal.volume:.2f} mm³")
+    print(f"Part volume before cut: {part.volume:.2f} mm³")
+
+    result = part.cut(*cutters)
+
+    print(f"Part volume after cut: {result.volume:.2f} mm³")
+
+    return result
 
 
 # ---------------------------------------------------------------------------#
@@ -421,6 +548,19 @@ def main():
         default=DEFAULT_PPMM,
         help="Pixels-per-mm if auto-detection fails",
     )
+
+    # Rectangular cut‑outs
+    cli.add_argument(
+        "--cut_width", type=str, metavar="WIDTH", help="Rect cut‑out width (e.g. 30mm)"
+    )
+    cli.add_argument(
+        "--cut_height",
+        type=str,
+        metavar="HEIGHT",
+        help="Rect cut‑out height (e.g. 20mm)",
+    )
+    cli.add_argument("--cut_count", type=int, help="Number of cut‑outs (optional)")
+
     cli.add_argument(
         "--debug",
         action="store_true",
@@ -460,6 +600,12 @@ def main():
         plug = carve_plug(
             plug, contour, depth, debug=args.debug or True, cutout_name=args.cutout.stem
         )
+
+    # Rectangular cut‑out grid
+    if args.cut_width and args.cut_height:
+        w_mm = parse_mm(args.cut_width)
+        h_mm = parse_mm(args.cut_height)
+        plug = carve_rect_grid(plug, w_mm, h_mm, args.cut_count, args.inner)
 
     export_stl(plug, outfile)
     print(f"\nExported: {outfile}")
