@@ -29,7 +29,7 @@ TOLERANCE_MM = 0.30  # wall clearance for the inner plug
 TOP_GAP_MM = 1.0  # gap above plug so you can pull it out
 MIN_HOLE_MM = 0.75  # fill gaps narrower than this when tracing
 DEFAULT_PPMM = 10  # default pixels-per-millimetre for --cutout
-MIN_SPACING_MM = 2.0  # minimum space between rectangular cut‑outs
+MIN_SPACING_MM = 0.6  # minimum space between rectangular cut‑outs
 
 
 # ---------------------------------------------------------------------------#
@@ -76,6 +76,8 @@ def best_grid(
 ) -> Tuple[int, int, float, float]:
     max_cols = math.floor((part_w + min_spacing) / (rect_w + min_spacing))
     max_rows = math.floor((part_h + min_spacing) / (rect_h + min_spacing))
+
+    print(f"max {max_cols}x{max_rows} and part = {part_w}x{part_h}")
 
     if max_cols == 0 or max_rows == 0:
         raise RuntimeError("Cut‑outs do not fit even once – part too small")
@@ -570,17 +572,25 @@ def main():
 
     shape, base = parse_shape(args.shape)
 
-    # Modify the filename to include the cutout name if provided
+    # Buildoutput filename parts
+    filename_parts = [base + f"x{args.height}"]
+
+    if args.inner:
+        filename_parts.append("inner")
     if args.cutout:
-        cutout_name = args.cutout.stem
-        outfile = f"{base}x{args.height}_{cutout_name}.stl"
-    else:
-        outfile = f"{base}x{args.height}.stl"
+        filename_parts.append(args.cutout.stem)
+    if args.cut_width or args.cut_height:
+        if args.cut_width:
+            filename_parts.append(f"w{args.cut_width}")
+        if args.cut_height:
+            filename_parts.append(f"h{args.cut_height}")
+
+    outfile = "_".join(filename_parts) + ".stl"
 
     print(f"\nOutput file will be: {outfile}")
 
     # Plain bin
-    if not args.inner and not args.cutout:
+    if not args.inner and not args.cutout and not (args.cut_width or args.cut_height):
         export_stl(FunkyBin(shape, height_units=args.height), outfile)
         print("Exported bin:", outfile)
         return
