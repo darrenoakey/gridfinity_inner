@@ -33,17 +33,10 @@ MIN_SPACING_MM = 0.6  # minimum space between rectangular cut‑outs
 
 
 # ---------------------------------------------------------------------------#
-# parse_shape – convert CLI tokens into a binary matrix                      #
+# create_shape – create a binary matrix from x and y dimensions              #
 # ---------------------------------------------------------------------------#
-def parse_shape(tokens: List[str]) -> Tuple[List[List[int]], str]:
-    if len(tokens) == 2 and all(t.isdigit() for t in tokens):
-        cols, rows = map(int, tokens)
-        matrix = [[1] * cols for _ in range(rows)]
-    else:
-        matrix = [[1 if c == "1" else 0 for c in row.strip()] for row in tokens]
-        cols = max(len(r) for r in matrix)
-        rows = len(matrix)
-    return matrix, f"gridfinity_{cols}x{rows}"
+def create_shape(x: int, y: int) -> List[List[int]]:
+    return [[1] * x for _ in range(y)]
 
 
 # ---------------------------------------------------------------------------#
@@ -67,17 +60,17 @@ def parse_mm(text: str) -> float:
 # grid).
 # ---------------------------------------------------------------------------#
 def best_grid(
-    part_w: float,
-    part_h: float,
-    rect_w: float,
-    rect_h: float,
+    part_x: float,
+    part_y: float,
+    rect_x: float,
+    rect_y: float,
     min_spacing: float = MIN_SPACING_MM,
     count: Optional[int] = None,
 ) -> Tuple[int, int, float, float]:
-    max_cols = math.floor((part_w + min_spacing) / (rect_w + min_spacing))
-    max_rows = math.floor((part_h + min_spacing) / (rect_h + min_spacing))
+    max_cols = math.floor((part_x + min_spacing) / (rect_x + min_spacing))
+    max_rows = math.floor((part_y + min_spacing) / (rect_y + min_spacing))
 
-    print(f"max {max_cols}x{max_rows} and part = {part_w}x{part_h}")
+    print(f"max {max_cols}x{max_rows} and part = {part_x}x{part_y}")
 
     if max_cols == 0 or max_rows == 0:
         raise RuntimeError("Cut‑outs do not fit even once – part too small")
@@ -90,8 +83,8 @@ def best_grid(
             total = rows * cols
             if count and total < count:
                 continue  # not enough pockets
-            sx = (part_w - cols * rect_w) / (cols + 1)
-            sy = (part_h - rows * rect_h) / (rows + 1)
+            sx = (part_x - cols * rect_x) / (cols + 1)
+            sy = (part_y - rows * rect_y) / (rows + 1)
             if sx < min_spacing or sy < min_spacing:
                 continue  # spacing too tight
             # Prefer fewer rows (makes long line) if multiple solutions equal
@@ -102,7 +95,7 @@ def best_grid(
 
     if best is None:
         raise RuntimeError(
-            "Unable to fit requested rectangular cut‑outs with ≥2 mm spacing"
+            "Unable to fit requested rectangular cut‑outs with ≥2 mm spacing"
         )
 
     _, cols, rows, sx, sy, _ = best
@@ -112,14 +105,14 @@ def best_grid(
 # ---------------------------------------------------------------------------#
 # carve_rect_grid – subtract a grid of rectangles from the part              #
 # ---------------------------------------------------------------------------#
-# Each rectangle is centred at Z depth so that 2 mm of material remains.
+# Each rectangle is centred at Z depth so that 2 mm of material remains.
 # ---------------------------------------------------------------------------#
 
 
 def carve_rect_grid(
     part,
-    rect_w: float,
-    rect_h: float,
+    rect_x: float,
+    rect_y: float,
     count: Optional[int],
     is_inner: bool,
 ):
@@ -127,16 +120,16 @@ def carve_rect_grid(
     from gfthings.parameters import plate_height
 
     bbox = part.bounding_box()
-    part_w = bbox.size.X - 2 * MIN_SPACING_MM  # leave outer 2 mm shell untouched
-    part_h = bbox.size.Y - 2 * MIN_SPACING_MM
+    part_x = bbox.size.X - 2 * MIN_SPACING_MM  # leave outer 2 mm shell untouched
+    part_y = bbox.size.Y - 2 * MIN_SPACING_MM
 
     cols, rows, sx, sy = best_grid(
-        part_w, part_h, rect_w, rect_h, MIN_SPACING_MM, count
+        part_x, part_y, rect_x, rect_y, MIN_SPACING_MM, count
     )
 
     # left/bottom offset so first spacing margin included
-    start_x = bbox.center().X - (cols - 1) * (rect_w + sx) / 2
-    start_y = bbox.center().Y - (rows - 1) * (rect_h + sy) / 2
+    start_x = bbox.center().X - (cols - 1) * (rect_x + sx) / 2
+    start_y = bbox.center().Y - (rows - 1) * (rect_y + sy) / 2
 
     # depth calculation
     depth = bbox.size.Z - 2.0
@@ -146,13 +139,13 @@ def carve_rect_grid(
 
     cutters = []
     for r in range(rows):
-        cy = start_y + r * (rect_h + sy)
+        cy = start_y + r * (rect_y + sy)
         for c in range(cols):
-            cx = start_x + c * (rect_w + sx)
+            cx = start_x + c * (rect_x + sx)
             with BuildPart():
                 z_top = bbox.max.Z
                 with BuildSketch(Plane.XY * Location((cx, cy, z_top))):
-                    Rectangle(rect_w, rect_h, align=(None, None))
+                    Rectangle(rect_x, rect_y, align=(None, None))
                 cut = extrude(amount=-depth)
                 cutters.append(cut)
 
@@ -379,7 +372,7 @@ def image_to_contour(
 # ---------------------------------------------------------------------------#
 def gridfinity_inner(
     shape: List[List[int]],
-    height_units: int = 3,
+    z_units: int = 3,
     tol: float = TOLERANCE_MM,
     top_gap: float = TOP_GAP_MM,
 ):
@@ -400,22 +393,22 @@ def gridfinity_inner(
 
     cols = max(len(r) for r in shape)
     rows = len(shape)
-    inner_w = cols * bin_size - 2 * (bin_clearance + WALL + tol)
-    inner_d = rows * bin_size - 2 * (bin_clearance + WALL + tol)
+    inner_x = cols * bin_size - 2 * (bin_clearance + WALL + tol)
+    inner_y = rows * bin_size - 2 * (bin_clearance + WALL + tol)
     inner_r = max(outer_rad - bin_clearance - WALL - tol, 0)
-    inner_h = height_units * 7 - plate_height - top_gap
+    inner_z = z_units * 7 - plate_height - top_gap
 
-    print(f"Creating insert: {cols}x{rows} grid, height {height_units} units")
+    print(f"Creating insert: {cols}x{rows} grid, z {z_units} units")
     print(
-        f"Insert dimensions: {inner_w:.2f}x{inner_d:.2f}x{inner_h:.2f} mm, corner radius: {inner_r:.2f} mm"
+        f"Insert dimensions: {inner_x:.2f}x{inner_y:.2f}x{inner_z:.2f} mm, corner radius: {inner_r:.2f} mm"
     )
 
     with BuildPart() as plug:
         with BuildSketch(Plane.XY):
             RectangleRounded(
-                inner_w, inner_d, inner_r, align=(Align.CENTER, Align.CENTER)
+                inner_x, inner_y, inner_r, align=(Align.CENTER, Align.CENTER)
             )
-        extrude(amount=inner_h)
+        extrude(amount=inner_z)
 
     print(f"Insert created successfully with volume: {plug.part.volume:.2f} mm³")
     return plug.part
@@ -523,18 +516,61 @@ def carve_plug(
 
 
 # ---------------------------------------------------------------------------#
+# merge_bin_with_cutouts – create a gridfinity bin with cutouts carved in    #
+# ---------------------------------------------------------------------------#
+def merge_bin_with_cutouts(bin_part, plug_part):
+    """
+    Take a gridfinity bin and a carved plug, and merge them to create
+    a bin with the cutouts carved into it.
+    """
+    from build123d import Location
+
+    # Get bounding boxes to calculate proper positioning
+    plug_bbox = plug_part.bounding_box()
+    bin_bbox = bin_part.bounding_box()
+
+    # Calculate Z offset to align the tops
+    # The plug's top should align with the bin's top
+    plug_height = plug_bbox.size.Z
+    bin_top_z = bin_bbox.max.Z
+    plug_bottom_z = bin_top_z - plug_height
+
+    # The plug is already centered at origin in X and Y, same as the bin
+    # So we only need to adjust Z position
+    z_offset = plug_bottom_z - plug_bbox.min.Z
+
+    print(f"Bin top Z: {bin_top_z:.2f} mm")
+    print(f"Plug height: {plug_height:.2f} mm")
+    print(f"Positioning plug with Z offset: {z_offset:.2f} mm")
+
+    positioned_plug = plug_part.moved(Location((0, 0, z_offset)))
+
+    # Verify alignment
+    positioned_bbox = positioned_plug.bounding_box()
+    print(f"Positioned plug top Z: {positioned_bbox.max.Z:.2f} mm")
+    print(f"Difference from bin top: {positioned_bbox.max.Z - bin_top_z:.2f} mm")
+
+    # Perform the boolean union
+    print("Merging bin with carved insert...")
+    merged = bin_part.fuse(positioned_plug)
+
+    print(f"Merged volume: {merged.volume:.2f} mm³")
+    print(f"Original bin volume: {bin_part.volume:.2f} mm³")
+    print(f"Original plug volume: {plug_part.volume:.2f} mm³")
+
+    return merged
+
+
+# ---------------------------------------------------------------------------#
 # main – CLI                                                                 #
 # ---------------------------------------------------------------------------#
 def main():
     cli = argparse.ArgumentParser(
         description="Generate Gridfinity bin STL, inner plug, or image-carved insert."
     )
-    cli.add_argument(
-        "shape",
-        nargs="+",
-        help="Two ints (cols rows) or binary rows; ignored with --cutout",
-    )
-    cli.add_argument("--height", type=int, default=3, help="Height units (default 3)")
+    cli.add_argument("--x", type=int, required=True, help="X dimension (grid units)")
+    cli.add_argument("--y", type=int, required=True, help="Y dimension (grid units)")
+    cli.add_argument("--z", type=int, required=True, help="Z dimension (height units)")
     cli.add_argument(
         "--inner", action="store_true", help="Export solid insert instead of bin"
     )
@@ -553,13 +589,13 @@ def main():
 
     # Rectangular cut‑outs
     cli.add_argument(
-        "--cut_width", type=str, metavar="WIDTH", help="Rect cut‑out width (e.g. 30mm)"
+        "--cut_x", type=str, metavar="X", help="Rect cut‑out X dimension (e.g. 30mm)"
     )
     cli.add_argument(
-        "--cut_height",
+        "--cut_y",
         type=str,
-        metavar="HEIGHT",
-        help="Rect cut‑out height (e.g. 20mm)",
+        metavar="Y",
+        help="Rect cut‑out Y dimension (e.g. 20mm)",
     )
     cli.add_argument("--cut_count", type=int, help="Number of cut‑outs (optional)")
 
@@ -570,35 +606,40 @@ def main():
     )
     args = cli.parse_args()
 
-    shape, base = parse_shape(args.shape)
+    # Create shape matrix from x and y dimensions
+    shape = create_shape(args.x, args.y)
+    base = f"gridfinity_{args.x}x{args.y}"
 
-    # Buildoutput filename parts
-    filename_parts = [base + f"x{args.height}"]
+    # Build output filename parts
+    filename_parts = [base + f"x{args.z}"]
 
     if args.inner:
         filename_parts.append("inner")
     if args.cutout:
         filename_parts.append(args.cutout.stem)
-    if args.cut_width or args.cut_height:
-        if args.cut_width:
-            filename_parts.append(f"w{args.cut_width}")
-        if args.cut_height:
-            filename_parts.append(f"h{args.cut_height}")
+    if args.cut_x or args.cut_y:
+        if args.cut_x:
+            filename_parts.append(f"x{args.cut_x}")
+        if args.cut_y:
+            filename_parts.append(f"y{args.cut_y}")
 
     outfile = "_".join(filename_parts) + ".stl"
 
     print(f"\nOutput file will be: {outfile}")
 
-    # Plain bin
-    if not args.inner and not args.cutout and not (args.cut_width or args.cut_height):
-        export_stl(FunkyBin(shape, height_units=args.height), outfile)
+    # Check if we need to carve cutouts
+    has_cutouts = args.cutout or (args.cut_x and args.cut_y)
+
+    # Plain bin - no cutouts and not inner
+    if not args.inner and not has_cutouts:
+        export_stl(FunkyBin(shape, height_units=args.z), outfile)
         print("Exported bin:", outfile)
         return
 
     # Start with solid plug
-    plug = gridfinity_inner(shape, args.height)
+    plug = gridfinity_inner(shape, args.z)
 
-    # Optional carve
+    # Apply cutouts to the plug
     if args.cutout:
         print(f"\nProcessing cutout image: {args.cutout}")
         contour = image_to_contour(
@@ -606,19 +647,29 @@ def main():
         )
         from gfthings.parameters import plate_height
 
-        depth = args.height * 7 - plate_height - 2 * TOP_GAP_MM
+        depth = args.z * 7 - plate_height - 2 * TOP_GAP_MM
         plug = carve_plug(
             plug, contour, depth, debug=args.debug or True, cutout_name=args.cutout.stem
         )
 
     # Rectangular cut‑out grid
-    if args.cut_width and args.cut_height:
-        w_mm = parse_mm(args.cut_width)
-        h_mm = parse_mm(args.cut_height)
-        plug = carve_rect_grid(plug, w_mm, h_mm, args.cut_count, args.inner)
+    if args.cut_x and args.cut_y:
+        x_mm = parse_mm(args.cut_x)
+        y_mm = parse_mm(args.cut_y)
+        plug = carve_rect_grid(plug, x_mm, y_mm, args.cut_count, args.inner)
 
-    export_stl(plug, outfile)
-    print(f"\nExported: {outfile}")
+    # Now decide what to export
+    if args.inner:
+        # Just export the carved plug
+        export_stl(plug, outfile)
+        print(f"\nExported inner plug: {outfile}")
+    else:
+        # Create a bin and merge it with the carved plug
+        print("\nCreating merged bin with cutouts...")
+        bin_part = FunkyBin(shape, height_units=args.z)
+        merged_part = merge_bin_with_cutouts(bin_part, plug)
+        export_stl(merged_part, outfile)
+        print(f"\nExported merged bin with cutouts: {outfile}")
 
 
 # ---------------------------------------------------------------------------#
