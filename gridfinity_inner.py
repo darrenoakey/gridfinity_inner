@@ -72,7 +72,7 @@ def best_grid(
     print(f"max {max_cols}x{max_rows} and part = {part_x}x{part_y}")
     if max_cols == 0 or max_rows == 0:
         raise RuntimeError("Cut‑outs do not fit even once – part too small")
-    best = None  # (total, cols, rows, sx, sy)
+    best = None  # (total, cols, rows, sx, sy, score)
     # Iterate rows/cols space – small search space so brute force is fine
     for rows in range(1, max_rows + 1):
         for cols in range(1, max_cols + 1):
@@ -94,6 +94,112 @@ def best_grid(
         )
     _, cols, rows, sx, sy, _ = best
     return cols, rows, sx, sy
+
+
+# ---------------------------------------------------------------------------#
+# best_circle_grid – choose rows/cols & spacing for circular cut‑outs #
+# ---------------------------------------------------------------------------#
+# Returns: cols, rows, spacing_x, spacing_y
+# spacing_x/Y includes the edge margins, guaranteed ≥ min_spacing
+# Raises RuntimeError if the circles cannot fit.
+# ---------------------------------------------------------------------------#
+def best_circle_grid(
+    part_x: float,
+    part_y: float,
+    radius: float,
+    min_spacing: float = 2.0,  # Default 2mm for circles
+    count: Optional[int] = None,
+) -> Tuple[int, int, float, float]:
+    diameter = 2 * radius
+    max_cols = math.floor((part_x + min_spacing) / (diameter + min_spacing))
+    max_rows = math.floor((part_y + min_spacing) / (diameter + min_spacing))
+    print(
+        f"max {max_cols}x{max_rows} circles, part = {part_x}x{part_y}, diameter = {diameter}"
+    )
+    if max_cols == 0 or max_rows == 0:
+        raise RuntimeError(
+            "Circles do not fit even once – part too small or radius too large"
+        )
+    best = None  # (total, cols, rows, sx, sy, score)
+    # Iterate rows/cols space – small search space so brute force is fine
+    for rows in range(1, max_rows + 1):
+        for cols in range(1, max_cols + 1):
+            total = rows * cols
+            if count and total < count:
+                continue  # not enough pockets
+            sx = (part_x - cols * diameter) / (cols + 1)
+            sy = (part_y - rows * diameter) / (rows + 1)
+            if sx < min_spacing or sy < min_spacing:
+                continue  # spacing too tight
+            # Prefer fewer rows (makes long line) if multiple solutions equal
+            score = (rows, -total)
+            cand = (total, cols, rows, sx, sy, score)
+            if best is None or cand[-1] < best[-1]:
+                best = cand
+    if best is None:
+        raise RuntimeError(
+            f"Unable to fit requested circular cut‑outs with ≥{min_spacing} mm spacing"
+        )
+    _, cols, rows, sx, sy, _ = best
+    return cols, rows, sx, sy
+
+
+# ---------------------------------------------------------------------------#
+# carve_circle_grid – subtract a grid of circles from the part #
+# ---------------------------------------------------------------------------#
+# Each circle is centred at Z depth so that 2 mm of material remains.
+# ---------------------------------------------------------------------------#
+def carve_circle_grid(
+    part,
+    radius: float,
+    count: Optional[int],
+    is_inner: bool,
+):
+    from build123d import (
+        BuildPart,
+        BuildSketch,
+        Circle,
+        Location,
+        extrude,
+        Plane,
+        Align,
+    )
+
+    bbox = part.bounding_box()
+    part_x = bbox.size.X - 2 * 2.0  # leave outer 2 mm shell untouched
+    part_y = bbox.size.Y - 2 * 2.0
+    cols, rows, sx, sy = best_circle_grid(part_x, part_y, radius, 2.0, count)
+    # left/bottom offset so first spacing margin included
+    diameter = 2 * radius
+    start_x = bbox.center().X - (cols - 1) * (diameter + sx) / 2
+    start_y = bbox.center().Y - (rows - 1) * (diameter + sy) / 2
+    # depth calculation
+    depth = bbox.size.Z - 2.0
+    if depth <= 0:
+        raise RuntimeError("Computed depth ≤0 – part too shallow for cut‑out")
+    print(f"Circle cutter depth: {depth:.2f} mm")
+    print(f"Circle radius: {radius:.2f} mm")
+    cutters = []
+    for r in range(rows):
+        cy = start_y + r * (diameter + sy)
+        for c in range(cols):
+            cx = start_x + c * (diameter + sx)
+            with BuildPart():
+                z_top = bbox.max.Z
+                with BuildSketch(Plane.XY * Location((cx, cy, z_top))):
+                    Circle(radius)
+                cut = extrude(amount=-depth)
+                cutters.append(cut)
+    # Boolean difference – union cutters then subtract once (faster)
+    from build123d import Compound
+
+    print(f"Total circle cutters: {len(cutters)}")
+    removal = Compound(*cutters)  # build123d ≥ 0.9
+    print(f"Cutter volume: {removal.volume:.2f} mm³")
+    print(f"Part volume before cut: {part.volume:.2f} mm³")
+    result = part.cut(*cutters)
+    print(f"Part volume after cut: {result.volume:.2f} mm³")
+    return result
 
 
 # ---------------------------------------------------------------------------#
@@ -874,6 +980,12 @@ def main():
         default=10.0,
         help="Fillet radius for cut‑out corners in mm (default: 10)",
     )
+    # Circular cut‑outs
+    cli.add_argument(
+        "--cutout_radius",
+        type=float,
+        help="Radius for circular cut‑outs in mm",
+    )
     cli.add_argument(
         "--debug",
         action="store_true",
@@ -885,8 +997,20 @@ def main():
     if args.solid and args.inner:
         cli.error("--solid and --inner cannot be used together")
 
-    if args.solid and (args.cutout or (args.cut_x and args.cut_y)):
-        cli.error("--solid cannot be used with cutouts (--cutout, --cut_x/--cut_y)")
+    if args.solid and (
+        args.cutout or (args.cut_x and args.cut_y) or args.cutout_radius
+    ):
+        cli.error(
+            "--solid cannot be used with cutouts (--cutout, --cut_x/--cut_y, --cutout_radius)"
+        )
+
+    if (args.cut_x and args.cut_y) and args.cutout_radius:
+        cli.error(
+            "Cannot use both rectangular (--cut_x/--cut_y) and circular (--cutout_radius) cutouts together"
+        )
+
+    if (args.cut_x and not args.cut_y) or (args.cut_y and not args.cut_x):
+        cli.error("Both --cut_x and --cut_y must be specified for rectangular cutouts")
 
     # Create shape matrix from x and y dimensions
     shape = create_shape(args.x, args.y)
@@ -908,10 +1032,16 @@ def main():
             filename_parts.append(f"y{args.cut_y}")
         if args.cut_fillet != 10.0:  # Only add to filename if not default
             filename_parts.append(f"f{args.cut_fillet}")
+    if args.cutout_radius:
+        filename_parts.append(f"r{args.cutout_radius}")
+        if args.cut_count:
+            filename_parts.append(f"n{args.cut_count}")
     outfile = "_".join(filename_parts) + ".stl"
     print(f"\nOutput file will be: {outfile}")
     # Check if we need to carve cutouts or create solid fill
-    has_cutouts = args.cutout or (args.cut_x and args.cut_y) or args.solid
+    has_cutouts = (
+        args.cutout or (args.cut_x and args.cut_y) or args.cutout_radius or args.solid
+    )
     # Plain bin - no cutouts and not inner
     if not args.inner and not has_cutouts:
         if args.stackable:
@@ -950,6 +1080,12 @@ def main():
             y_mm = parse_mm(args.cut_y)
             plug = carve_rect_grid(
                 plug, x_mm, y_mm, args.cut_count, args.inner, args.cut_fillet
+            )
+
+        # Circular cut‑out grid
+        if args.cutout_radius:
+            plug = carve_circle_grid(
+                plug, args.cutout_radius, args.cut_count, args.inner
             )
     else:
         print("Creating solid-filled bin (no cutouts)")
@@ -1041,6 +1177,15 @@ else:
 
             # The solid bin should have significantly more volume
             self.assertGreater(merged.volume, hollow_bin.volume * 1.5)
+
+        def test_circle_grid_calculation(self):
+            # Test that we can fit circles in a space
+            cols, rows, sx, sy = best_circle_grid(40.0, 40.0, 5.0, 2.0, None)
+            # Should fit at least 2x2 circles of radius 5mm in a 40x40 space
+            self.assertGreaterEqual(cols * rows, 4)
+            # Spacing should be at least 2mm
+            self.assertGreaterEqual(sx, 2.0)
+            self.assertGreaterEqual(sy, 2.0)
 
 
 #    unittest.main(verbosity=2, exit=False)
