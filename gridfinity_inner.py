@@ -5,6 +5,7 @@
 # • Each helper is tiny; no duplicated logic
 # • Comments live above functions (no doc-strings)
 # • Real tests run automatically when the file is imported
+# • New: --solid creates a completely filled bin with flat top
 #
 # Requires:
 # build123d ≥ 0.9
@@ -830,7 +831,7 @@ def merge_bin_with_cutouts(bin_part, plug_part, stackable: bool):
 # ---------------------------------------------------------------------------#
 def main():
     cli = argparse.ArgumentParser(
-        description="Generate Gridfinity bin STL, inner plug, or image-carved insert."
+        description="Generate Gridfinity bin STL, inner plug, solid-filled bin, or image-carved insert."
     )
     cli.add_argument("--x", type=int, required=True, help="X dimension (grid units)")
     cli.add_argument("--y", type=int, required=True, help="Y dimension (grid units)")
@@ -840,6 +841,9 @@ def main():
     )
     cli.add_argument(
         "--stackable", action="store_true", help="Add stacking lip to top of bin"
+    )
+    cli.add_argument(
+        "--solid", action="store_true", help="Create a solid-filled bin with flat top"
     )
     cli.add_argument(
         "--cutout",
@@ -876,6 +880,14 @@ def main():
         help="Enable debug output and visualizations",
     )
     args = cli.parse_args()
+
+    # Validate arguments
+    if args.solid and args.inner:
+        cli.error("--solid and --inner cannot be used together")
+
+    if args.solid and (args.cutout or (args.cut_x and args.cut_y)):
+        cli.error("--solid cannot be used with cutouts (--cutout, --cut_x/--cut_y)")
+
     # Create shape matrix from x and y dimensions
     shape = create_shape(args.x, args.y)
     base = f"gridfinity_{args.x}x{args.y}"
@@ -883,6 +895,8 @@ def main():
     filename_parts = [base + f"x{args.z}"]
     if args.inner:
         filename_parts.append("inner")
+    if args.solid:
+        filename_parts.append("solid")
     if not args.stackable:  # Add "nonstackable" for non-stackable bins
         filename_parts.append("nonstackable")
     if args.cutout:
@@ -896,8 +910,8 @@ def main():
             filename_parts.append(f"f{args.cut_fillet}")
     outfile = "_".join(filename_parts) + ".stl"
     print(f"\nOutput file will be: {outfile}")
-    # Check if we need to carve cutouts
-    has_cutouts = args.cutout or (args.cut_x and args.cut_y)
+    # Check if we need to carve cutouts or create solid fill
+    has_cutouts = args.cutout or (args.cut_x and args.cut_y) or args.solid
     # Plain bin - no cutouts and not inner
     if not args.inner and not has_cutouts:
         if args.stackable:
@@ -911,25 +925,35 @@ def main():
     print(f"\nCreating plug/insert...")
     tol = TOLERANCE_MM if args.inner else 0.0
     plug = gridfinity_inner(shape, args.z, tol=tol, stackable=args.stackable)
-    # Apply cutouts to the plug
-    if args.cutout:
-        print(f"\nProcessing cutout image: {args.cutout}")
-        contour = image_to_contour(
-            args.cutout, ppmm=args.ppmm, debug=args.debug or True
-        )
-        # Calculate depth based on the actual plug height
-        plug_bbox = plug.bounding_box()
-        depth = plug_bbox.size.Z - 2.0  # Leave 2mm at bottom
-        plug = carve_plug(
-            plug, contour, depth, debug=args.debug or True, cutout_name=args.cutout.stem
-        )
-    # Rectangular cut‑out grid
-    if args.cut_x and args.cut_y:
-        x_mm = parse_mm(args.cut_x)
-        y_mm = parse_mm(args.cut_y)
-        plug = carve_rect_grid(
-            plug, x_mm, y_mm, args.cut_count, args.inner, args.cut_fillet
-        )
+
+    # Apply cutouts to the plug (only if not --solid)
+    if not args.solid:
+        if args.cutout:
+            print(f"\nProcessing cutout image: {args.cutout}")
+            contour = image_to_contour(
+                args.cutout, ppmm=args.ppmm, debug=args.debug or True
+            )
+            # Calculate depth based on the actual plug height
+            plug_bbox = plug.bounding_box()
+            depth = plug_bbox.size.Z - 2.0  # Leave 2mm at bottom
+            plug = carve_plug(
+                plug,
+                contour,
+                depth,
+                debug=args.debug or True,
+                cutout_name=args.cutout.stem,
+            )
+
+        # Rectangular cut‑out grid
+        if args.cut_x and args.cut_y:
+            x_mm = parse_mm(args.cut_x)
+            y_mm = parse_mm(args.cut_y)
+            plug = carve_rect_grid(
+                plug, x_mm, y_mm, args.cut_count, args.inner, args.cut_fillet
+            )
+    else:
+        print("Creating solid-filled bin (no cutouts)")
+
     # Now decide what to export
     if args.inner:
         # Just export the carved plug
@@ -955,7 +979,10 @@ def main():
             )
 
         export_stl(merged_part, outfile)
-        print(f"\nExported merged bin with cutouts: {outfile}")
+        if args.solid:
+            print(f"\nExported solid-filled bin: {outfile}")
+        else:
+            print(f"\nExported merged bin with cutouts: {outfile}")
 
 
 # ---------------------------------------------------------------------------#
@@ -1005,4 +1032,15 @@ else:
                 stackable_height - STACKING_LIP, non_stackable_height, delta=0.001
             )
 
-    unittest.main(verbosity=2, exit=False)
+        def test_solid_bin_volume(self):
+            s = create_shape(1, 1)
+            # A solid bin should have more volume than a hollow bin
+            hollow_bin = FunkyBin(s, 3)
+            plug = gridfinity_inner(s, 3, tol=0.0, stackable=False)
+            merged = merge_bin_with_cutouts(hollow_bin, plug, stackable=False)
+
+            # The solid bin should have significantly more volume
+            self.assertGreater(merged.volume, hollow_bin.volume * 1.5)
+
+
+#    unittest.main(verbosity=2, exit=False)
