@@ -154,6 +154,7 @@ def carve_circle_grid(
     radius: float,
     count: Optional[int],
     is_inner: bool,
+    custom_depth: Optional[float] = None,
 ):
     from build123d import (
         BuildPart,
@@ -174,7 +175,15 @@ def carve_circle_grid(
     start_x = bbox.center().X - (cols - 1) * (diameter + sx) / 2
     start_y = bbox.center().Y - (rows - 1) * (diameter + sy) / 2
     # depth calculation
-    depth = bbox.size.Z - 2.0
+    if custom_depth is not None:
+        depth = custom_depth
+        if depth > bbox.size.Z - 2.0:
+            raise RuntimeError(
+                f"Custom depth {depth}mm exceeds maximum allowed depth {bbox.size.Z - 2.0}mm"
+            )
+    else:
+        depth = bbox.size.Z - 2.0
+
     if depth <= 0:
         raise RuntimeError("Computed depth ≤0 – part too shallow for cut‑out")
     print(f"Circle cutter depth: {depth:.2f} mm")
@@ -206,6 +215,7 @@ def carve_circle_grid(
 # carve_rect_grid – subtract a grid of rectangles from the part #
 # ---------------------------------------------------------------------------#
 # Each rectangle is centred at Z depth so that 2 mm of material remains.
+# If round_bottom is True, creates a curved bottom along the longest dimension.
 # ---------------------------------------------------------------------------#
 def carve_rect_grid(
     part,
@@ -214,17 +224,25 @@ def carve_rect_grid(
     count: Optional[int],
     is_inner: bool,
     fillet_radius: float = 0.0,
+    round_bottom: bool = False,
+    custom_depth: Optional[float] = None,
 ):
     from build123d import (
         BuildPart,
         BuildSketch,
         Rectangle,
         RectangleRounded,
+        Circle,
+        Ellipse,
         Location,
+        Locations,
         extrude,
         Plane,
         Align,
+        Compound,
+        Mode,
     )
+    import math
 
     bbox = part.bounding_box()
     part_x = bbox.size.X - 2 * MIN_SPACING_MM  # leave outer 2 mm shell untouched
@@ -236,44 +254,118 @@ def carve_rect_grid(
     start_x = bbox.center().X - (cols - 1) * (rect_x + sx) / 2
     start_y = bbox.center().Y - (rows - 1) * (rect_y + sy) / 2
     # depth calculation
-    depth = bbox.size.Z - 2.0
+    if custom_depth is not None:
+        depth = custom_depth
+        if depth > bbox.size.Z - 2.0:
+            raise RuntimeError(
+                f"Custom depth {depth}mm exceeds maximum allowed depth {bbox.size.Z - 2.0}mm"
+            )
+    else:
+        depth = bbox.size.Z - 2.0
+
     if depth <= 0:
         raise RuntimeError("Computed depth ≤0 – part too shallow for cut‑out")
     print(f"Cutter depth: {depth:.2f} mm")
     if fillet_radius > 0:
         print(f"Using fillet radius: {fillet_radius:.2f} mm")
+    if round_bottom:
+        print(f"Using rounded bottom cutout")
+        print(
+            f" Rectangle dimensions: {rect_x:.2f} x {rect_y:.2f} mm, depth: {depth:.2f} mm"
+        )
+
     cutters = []
+    z_top = bbox.max.Z
+
     for r in range(rows):
         cy = start_y + r * (rect_y + sy)
         for c in range(cols):
             cx = start_x + c * (rect_x + sx)
-            with BuildPart():
-                z_top = bbox.max.Z
-                with BuildSketch(Plane.XY * Location((cx, cy, z_top))):
-                    if fillet_radius > 0:
-                        # Ensure fillet radius isn't too large
-                        max_fillet = min(rect_x, rect_y) / 2
-                        actual_fillet = min(fillet_radius, max_fillet)
-                        if actual_fillet < fillet_radius:
-                            print(
-                                f"Warning: Fillet radius reduced to {actual_fillet:.2f} mm to fit rectangle"
-                            )
-                        RectangleRounded(
-                            rect_x,
-                            rect_y,
-                            actual_fillet,
-                            align=(Align.CENTER, Align.CENTER),
-                        )
-                    else:
-                        Rectangle(rect_x, rect_y, align=(Align.CENTER, Align.CENTER))
-                cut = extrude(amount=-depth)
-                cutters.append(cut)
-    # Boolean difference – union cutters then subtract once (faster)
-    from build123d import Compound
 
+            if round_bottom:
+                # Create an elliptical cylinder cutout
+                with BuildPart():
+                    if rect_x < rect_y:
+                        # X is shorter - axis along X, curve along Y (longer)
+                        length = rect_x
+                        horizontal_radius = rect_y / 2
+                        vertical_radius = depth
+                        print(
+                            f" Creating elliptical cutout: length {length:.2f} mm along X"
+                        )
+                        print(
+                            f" Horizontal radius (along Y): {horizontal_radius:.2f} mm"
+                        )
+                        print(f" Vertical radius (along Z): {vertical_radius:.2f} mm")
+
+                        # Position plane at x = cx - length/2, y=cy, z=z_top
+                        with BuildSketch(
+                            Plane.YZ.move(Location((cx - length / 2, cy, z_top)))
+                        ):
+                            Ellipse(
+                                x_radius=horizontal_radius, y_radius=vertical_radius
+                            )
+                        cut = extrude(amount=length)
+
+                        if hasattr(cut, "volume"):
+                            print(
+                                f" Created elliptical cut with volume: {cut.volume:.2f} mm³"
+                            )
+                        cutters.append(cut)
+                    else:
+                        # Y is shorter (or equal) - axis along Y, curve along X (longer)
+                        length = rect_y
+                        horizontal_radius = rect_x / 2
+                        vertical_radius = depth
+                        print(
+                            f" Creating elliptical cutout: length {length:.2f} mm along Y"
+                        )
+                        print(
+                            f" Horizontal radius (along X): {horizontal_radius:.2f} mm"
+                        )
+                        print(f" Vertical radius (along Z): {vertical_radius:.2f} mm")
+
+                        # Position plane at y = cy - length/2, x=cx, z=z_top
+                        with BuildSketch(
+                            Plane.XZ.move(Location((cx, cy - length / 2, z_top)))
+                        ):
+                            Ellipse(
+                                x_radius=horizontal_radius, y_radius=vertical_radius
+                            )
+                        cut = extrude(amount=length)
+
+                        if hasattr(cut, "volume"):
+                            print(
+                                f" Created elliptical cut with volume: {cut.volume:.2f} mm³"
+                            )
+                        cutters.append(cut)
+            else:
+                # Original flat-bottom cutter
+                with BuildPart():
+                    with BuildSketch(Plane.XY * Location((cx, cy, z_top))):
+                        if fillet_radius > 0:
+                            # Ensure fillet radius isn't too large
+                            max_fillet = min(rect_x, rect_y) / 2
+                            actual_fillet = min(fillet_radius, max_fillet)
+                            if actual_fillet < fillet_radius:
+                                print(
+                                    f"Warning: Fillet radius reduced to {actual_fillet:.2f} mm to fit rectangle"
+                                )
+                            RectangleRounded(
+                                rect_x,
+                                rect_y,
+                                actual_fillet,
+                                align=(Align.CENTER, Align.CENTER),
+                            )
+                        else:
+                            Rectangle(
+                                rect_x, rect_y, align=(Align.CENTER, Align.CENTER)
+                            )
+                    cut = extrude(amount=-depth)
+                    cutters.append(cut)
+
+    # Boolean difference – subtract cutters
     print(f"Total cutters: {len(cutters)}")
-    removal = Compound(*cutters)  # build123d ≥ 0.9
-    print(f"Cutter volume: {removal.volume:.2f} mm³")
     print(f"Part volume before cut: {part.volume:.2f} mm³")
     result = part.cut(*cutters)
     print(f"Part volume after cut: {result.volume:.2f} mm³")
@@ -491,7 +583,6 @@ def gridfinity_inner(
     inner_x = cols * bin_size - 2 * (bin_clearance + WALL + tol)
     inner_y = rows * bin_size - 2 * (bin_clearance + WALL + tol)
     inner_r = max(outer_rad - bin_clearance - WALL - tol, 0)
-
     # Adjust height based on stackability
     if stackable:
         # With stacking lip, leave room for the lip and a gap to pull out
@@ -500,7 +591,6 @@ def gridfinity_inner(
         # Without stacking lip, extend all the way to the top
         # No gap needed since we want it flush
         inner_z = z_units * 7
-
     print(f"Calculated inner_z: {inner_z:.2f} mm")
     print(f"Creating insert: {cols}x{rows} grid, z {z_units} units")
     print(f"Stackable: {stackable}")
@@ -536,6 +626,15 @@ def carve_plug(
 
     print(f"\nCarving cutout with depth: {depth_mm:.2f} mm")
     print(f"Contour has {len(contour_mm)} points")
+
+    # Check if depth is valid
+    bbox = plug_part.bounding_box()
+    max_depth = bbox.size.Z - 2.0
+    if depth_mm > max_depth:
+        raise RuntimeError(
+            f"Depth {depth_mm}mm exceeds maximum allowed depth {max_depth}mm"
+        )
+
     # Create 3D points
     points_3d = [Vector(float(x), float(y), 0) for x, y in contour_mm]
     # Ensure the contour is closed
@@ -636,28 +735,22 @@ def create_non_stackable_bin(shape: List[List[int]], z_units: int):
         STACKING_LIP = stacking_lip_height
     except ImportError:
         STACKING_LIP = 4.4
-
     try:
         from gfthings.parameters import wall_thickness as WALL
     except ImportError:
         WALL = 1.2
-
     # First create a standard bin to get the base with gridfinity features
     standard_bin = FunkyBin(shape, height_units=z_units)
     standard_bbox = standard_bin.bounding_box()
-
     # The height without the lip
     target_height = standard_bbox.size.Z - STACKING_LIP
-
     print(f"\nCreating non-stackable bin:")
     print(f" Grid: {len(shape[0])}x{len(shape)}, height units: {z_units}")
     print(
         f" Target height: {target_height:.6f} mm (stackable was {standard_bbox.size.Z:.6f} mm)"
     )
-
     cols = max(len(r) for r in shape)
     rows = len(shape)
-
     # Calculate dimensions
     outer_x = cols * bin_size - 2 * bin_clearance
     outer_y = rows * bin_size - 2 * bin_clearance
@@ -665,7 +758,6 @@ def create_non_stackable_bin(shape: List[List[int]], z_units: int):
     inner_x = outer_x - 2 * WALL
     inner_y = outer_y - 2 * WALL
     inner_r = max(outer_r - WALL, 0)
-
     # Extract just the base plate with gridfinity features
     with BuildPart():
         with BuildSketch(Plane.XY * Location((0, 0, plate_height))):
@@ -675,12 +767,9 @@ def create_non_stackable_bin(shape: List[List[int]], z_units: int):
                 align=(Align.CENTER, Align.CENTER),
             )
         base_cutter = extrude(amount=target_height)
-
     base_plate = standard_bin - base_cutter
-
     # Create straight walls from plate_height to target_height
     wall_height = target_height - plate_height
-
     with BuildPart():
         with BuildSketch(Plane.XY * Location((0, 0, plate_height))):
             # Outer wall
@@ -696,17 +785,14 @@ def create_non_stackable_bin(shape: List[List[int]], z_units: int):
                 align=(Align.CENTER, Align.CENTER),
             )
         walls = extrude(amount=wall_height)
-
     # Combine base and walls
     result = base_plate + walls
-
     # Verify the height
     result_bbox = result.bounding_box()
     print(f"Non-stackable bin created with height: {result_bbox.size.Z:.6f} mm")
     print(
         f"Height difference from target: {abs(result_bbox.size.Z - target_height):.6f} mm"
     )
-
     return result
 
 
@@ -731,16 +817,12 @@ def convert_to_non_stackable(merged_part, shape: List[List[int]]):
         STACKING_LIP = stacking_lip_height
     except ImportError:
         STACKING_LIP = 4.4
-
     bbox = merged_part.bounding_box()
-
     # The lip starts at this height
     lip_start_z = bbox.max.Z - STACKING_LIP
-
     print(
         f"Converting to non-stackable: cutting at Z={lip_start_z:.2f} mm (removing {STACKING_LIP:.2f} mm lip)"
     )
-
     # Cut off everything above lip_start_z
     with BuildPart():
         with BuildSketch(Plane.XY * Location((0, 0, lip_start_z))):
@@ -748,16 +830,13 @@ def convert_to_non_stackable(merged_part, shape: List[List[int]]):
                 bbox.size.X + 10, bbox.size.Y + 10, align=(Align.CENTER, Align.CENTER)
             )
         cutter = extrude(amount=STACKING_LIP + 1)
-
     result = merged_part - cutter
     final_bbox = result.bounding_box()
     print(f"After cutting lip: height = {final_bbox.size.Z:.2f} mm")
-
     print(f"Converted to non-stackable bin")
     print(
         f"Final height: {final_bbox.size.Z:.2f} mm (original was {bbox.size.Z:.2f} mm)"
     )
-
     return result
 
 
@@ -787,32 +866,25 @@ def remove_stacking_lip(bin_part):
         STACKING_LIP = stacking_lip_height
     except ImportError:
         STACKING_LIP = 4.4  # Default stacking lip height
-
     try:
         from gfthings.parameters import wall_thickness as WALL
     except ImportError:
         WALL = 1.2
-
     bbox = bin_part.bounding_box()
-
     # Calculate the shape dimensions
     cols = round(bbox.size.X / bin_size)
     rows = round(bbox.size.Y / bin_size)
-
     # Calculate where the stacking lip starts (the height we want to modify from)
     lip_start_z = bbox.max.Z - STACKING_LIP
-
     # Create a shell that extends the walls straight up
     # Outer dimensions (same as bin)
     outer_x = cols * bin_size - 2 * bin_clearance
     outer_y = rows * bin_size - 2 * bin_clearance
     outer_r = outer_rad - bin_clearance
-
     # Inner dimensions (for the cavity)
     inner_x = outer_x - 2 * WALL
     inner_y = outer_y - 2 * WALL
     inner_r = max(outer_r - WALL, 0)
-
     # Create the extension piece
     with BuildPart():
         # Start at the lip start height
@@ -827,7 +899,6 @@ def remove_stacking_lip(bin_part):
             )
         # Extrude up to the full height
         extension = extrude(amount=STACKING_LIP)
-
         # Now cut out the inner cavity from the extension
         with BuildSketch(
             Plane.XY * Location((0, 0, lip_start_z - 0.1))
@@ -836,9 +907,7 @@ def remove_stacking_lip(bin_part):
                 inner_x, inner_y, inner_r, align=(Align.CENTER, Align.CENTER)
             )
         cavity_cut = extrude(amount=STACKING_LIP + 0.2)  # Cut through completely
-
     extension = extension - cavity_cut
-
     # First cut off the existing stacking lip
     with BuildPart():
         with BuildSketch(Plane.XY * Location((0, 0, lip_start_z))):
@@ -846,11 +915,9 @@ def remove_stacking_lip(bin_part):
                 bbox.size.X + 10, bbox.size.Y + 10, align=(Align.CENTER, Align.CENTER)
             )
         cutter = extrude(amount=STACKING_LIP + 1)
-
     # Remove the old lip and add the new straight extension
     result = bin_part - cutter
     result = result + extension
-
     print(f"Converted to non-stackable bin (maintained total height)")
     return result
 
@@ -866,14 +933,11 @@ def merge_bin_with_cutouts(bin_part, plug_part, stackable: bool):
     # Get bounding boxes to calculate proper positioning
     plug_bbox = plug_part.bounding_box()
     bin_bbox = bin_part.bounding_box()
-
     # The plug should always start at plate_height from the bottom
     bin_bottom_z = bin_bbox.min.Z
     plug_target_bottom_z = bin_bottom_z + plate_height
-
     # Calculate the offset needed
     z_offset = plug_target_bottom_z - plug_bbox.min.Z
-
     print(f"\nMerging bin with plug:")
     print(f"Bin bottom Z: {bin_bottom_z:.6f} mm")
     print(f"Bin top Z: {bin_bbox.max.Z:.6f} mm")
@@ -881,17 +945,13 @@ def merge_bin_with_cutouts(bin_part, plug_part, stackable: bool):
     print(f"Plug will be positioned with bottom at Z: {plug_target_bottom_z:.6f} mm")
     print(f"Z offset: {z_offset:.6f} mm")
     print(f"Stackable: {stackable}")
-
     positioned_plug = plug_part.moved(Location((0, 0, z_offset)))
-
     # Verify alignment
     positioned_bbox = positioned_plug.bounding_box()
     print(f"Positioned plug bottom Z: {positioned_bbox.min.Z:.6f} mm")
     print(f"Positioned plug top Z: {positioned_bbox.max.Z:.6f} mm")
-
     top_difference = positioned_bbox.max.Z - bin_bbox.max.Z
     print(f"Difference from bin top: {top_difference:.6f} mm")
-
     if not stackable:
         # For non-stackable, the plug MUST reach exactly to the bin top
         if abs(top_difference) > 0.0001:  # 0.1 micron tolerance
@@ -899,18 +959,15 @@ def merge_bin_with_cutouts(bin_part, plug_part, stackable: bool):
             print(f" Bin top: {bin_bbox.max.Z:.6f} mm")
             print(f" Plug top: {positioned_bbox.max.Z:.6f} mm")
             print(f" Difference: {top_difference:.6f} mm")
-
             # Force exact alignment by adjusting plug height
             print("Applying micro-adjustment to ensure perfect flush alignment...")
             z_correction = bin_bbox.max.Z - positioned_bbox.max.Z
             positioned_plug = positioned_plug.moved(Location((0, 0, z_correction)))
-
             # Re-check
             positioned_bbox = positioned_plug.bounding_box()
             new_difference = positioned_bbox.max.Z - bin_bbox.max.Z
             print(f"After correction - plug top Z: {positioned_bbox.max.Z:.6f} mm")
             print(f"Final difference: {new_difference:.6f} mm")
-
             if abs(new_difference) > 0.0001:
                 print("ERROR: Could not achieve perfect alignment!")
     else:
@@ -920,15 +977,12 @@ def merge_bin_with_cutouts(bin_part, plug_part, stackable: bool):
             print(
                 f"WARNING: Stackable plug may be too tall (gap: {-top_difference:.2f} mm, expected: {TOP_GAP_MM:.2f} mm)"
             )
-
     # Perform the boolean union
     print("Performing boolean union...")
     merged = bin_part.fuse(positioned_plug)
-
     print(f"Merged volume: {merged.volume:.2f} mm³")
     print(f"Original bin volume: {bin_part.volume:.2f} mm³")
     print(f"Original plug volume: {plug_part.volume:.2f} mm³")
-
     return merged
 
 
@@ -980,6 +1034,16 @@ def main():
         default=10.0,
         help="Fillet radius for cut‑out corners in mm (default: 10)",
     )
+    cli.add_argument(
+        "--cut_round",
+        action="store_true",
+        help="Round the bottom of rectangular cutouts (for cylindrical items)",
+    )
+    cli.add_argument(
+        "--cutout_depth",
+        type=float,
+        help="Custom depth for cutouts in mm (default: part height - 2mm)",
+    )
     # Circular cut‑outs
     cli.add_argument(
         "--cutout_radius",
@@ -992,26 +1056,32 @@ def main():
         help="Enable debug output and visualizations",
     )
     args = cli.parse_args()
-
     # Validate arguments
     if args.solid and args.inner:
         cli.error("--solid and --inner cannot be used together")
-
     if args.solid and (
         args.cutout or (args.cut_x and args.cut_y) or args.cutout_radius
     ):
         cli.error(
             "--solid cannot be used with cutouts (--cutout, --cut_x/--cut_y, --cutout_radius)"
         )
-
     if (args.cut_x and args.cut_y) and args.cutout_radius:
         cli.error(
             "Cannot use both rectangular (--cut_x/--cut_y) and circular (--cutout_radius) cutouts together"
         )
-
     if (args.cut_x and not args.cut_y) or (args.cut_y and not args.cut_x):
         cli.error("Both --cut_x and --cut_y must be specified for rectangular cutouts")
 
+    if args.cut_round and not (args.cut_x and args.cut_y):
+        cli.error("--cut_round requires rectangular cutouts (--cut_x and --cut_y)")
+
+    if args.cut_round and args.cutout_radius:
+        cli.error("--cut_round only works with rectangular cutouts, not circular")
+
+    if args.cut_round and args.cut_fillet != 10.0:
+        cli.error(
+            "--cut_round cannot be used with --cut_fillet (rounded bottoms don't support filleted corners)"
+        )
     # Create shape matrix from x and y dimensions
     shape = create_shape(args.x, args.y)
     base = f"gridfinity_{args.x}x{args.y}"
@@ -1032,10 +1102,14 @@ def main():
             filename_parts.append(f"y{args.cut_y}")
         if args.cut_fillet != 10.0:  # Only add to filename if not default
             filename_parts.append(f"f{args.cut_fillet}")
+        if args.cut_round:
+            filename_parts.append("round")
     if args.cutout_radius:
         filename_parts.append(f"r{args.cutout_radius}")
         if args.cut_count:
             filename_parts.append(f"n{args.cut_count}")
+    if args.cutout_depth:
+        filename_parts.append(f"d{args.cutout_depth}")
     outfile = "_".join(filename_parts) + ".stl"
     print(f"\nOutput file will be: {outfile}")
     # Check if we need to carve cutouts or create solid fill
@@ -1055,7 +1129,6 @@ def main():
     print(f"\nCreating plug/insert...")
     tol = TOLERANCE_MM if args.inner else 0.0
     plug = gridfinity_inner(shape, args.z, tol=tol, stackable=args.stackable)
-
     # Apply cutouts to the plug (only if not --solid)
     if not args.solid:
         if args.cutout:
@@ -1065,7 +1138,16 @@ def main():
             )
             # Calculate depth based on the actual plug height
             plug_bbox = plug.bounding_box()
-            depth = plug_bbox.size.Z - 2.0  # Leave 2mm at bottom
+            if args.cutout_depth:
+                depth = args.cutout_depth
+                max_depth = plug_bbox.size.Z - 2.0
+                if depth > max_depth:
+                    print(
+                        f"Warning: Requested depth {depth}mm exceeds maximum {max_depth}mm, using maximum"
+                    )
+                    depth = max_depth
+            else:
+                depth = plug_bbox.size.Z - 2.0  # Leave 2mm at bottom
             plug = carve_plug(
                 plug,
                 contour,
@@ -1073,23 +1155,32 @@ def main():
                 debug=args.debug or True,
                 cutout_name=args.cutout.stem,
             )
-
         # Rectangular cut‑out grid
         if args.cut_x and args.cut_y:
             x_mm = parse_mm(args.cut_x)
             y_mm = parse_mm(args.cut_y)
             plug = carve_rect_grid(
-                plug, x_mm, y_mm, args.cut_count, args.inner, args.cut_fillet
+                plug,
+                x_mm,
+                y_mm,
+                args.cut_count,
+                args.inner,
+                args.cut_fillet,
+                round_bottom=args.cut_round,
+                custom_depth=args.cutout_depth,
             )
 
         # Circular cut‑out grid
         if args.cutout_radius:
             plug = carve_circle_grid(
-                plug, args.cutout_radius, args.cut_count, args.inner
+                plug,
+                args.cutout_radius,
+                args.cut_count,
+                args.inner,
+                custom_depth=args.cutout_depth,
             )
     else:
         print("Creating solid-filled bin (no cutouts)")
-
     # Now decide what to export
     if args.inner:
         # Just export the carved plug
@@ -1102,10 +1193,8 @@ def main():
         bin_part = FunkyBin(shape, height_units=args.z)
         bin_bbox = bin_part.bounding_box()
         print(f"Initial bin height: {bin_bbox.size.Z:.2f} mm")
-
         # Merge the cutouts first
         merged_part = merge_bin_with_cutouts(bin_part, plug, args.stackable)
-
         # Then convert to non-stackable if needed
         if not args.stackable:
             merged_part = convert_to_non_stackable(merged_part, shape)
@@ -1113,7 +1202,6 @@ def main():
             print(
                 f"Non-stackable final height: {final_bbox.size.Z:.2f} mm (should match initial: {bin_bbox.size.Z:.2f} mm)"
             )
-
         export_stl(merged_part, outfile)
         if args.solid:
             print(f"\nExported solid-filled bin: {outfile}")
@@ -1155,7 +1243,6 @@ else:
             # Non-stackable bins should be shorter than stackable by the lip height
             stackable_bin = FunkyBin(s, 3)
             non_stackable_bin = create_non_stackable_bin(s, 3)
-
             stackable_height = stackable_bin.bounding_box().size.Z
             non_stackable_height = non_stackable_bin.bounding_box().size.Z
             try:
@@ -1174,7 +1261,6 @@ else:
             hollow_bin = FunkyBin(s, 3)
             plug = gridfinity_inner(s, 3, tol=0.0, stackable=False)
             merged = merge_bin_with_cutouts(hollow_bin, plug, stackable=False)
-
             # The solid bin should have significantly more volume
             self.assertGreater(merged.volume, hollow_bin.volume * 1.5)
 
@@ -1187,5 +1273,22 @@ else:
             self.assertGreaterEqual(sx, 2.0)
             self.assertGreaterEqual(sy, 2.0)
 
+        def test_custom_depth(self):
+            s = create_shape(2, 2)
+            # Test that custom depth works
+            plug = gridfinity_inner(s, 3, stackable=True)
+            result = carve_circle_grid(plug, 5.0, None, True, 10.0)
+            # Check that volume was reduced
+            self.assertLess(result.volume, plug.volume)
 
-#    unittest.main(verbosity=2, exit=False)
+        def test_rounded_bottom(self):
+            # Test that rounded bottom creates a valid cutout
+            s = create_shape(2, 2)
+            plug = gridfinity_inner(s, 3, stackable=True)
+            # Just test that the function runs without error
+            result = carve_rect_grid(plug, 20.0, 40.0, None, True, 0.0, True, None)
+            # Check that volume was reduced
+            self.assertLess(result.volume, plug.volume)
+
+
+# unittest.main(verbosity=2, exit=False)
