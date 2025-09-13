@@ -147,7 +147,7 @@ def best_circle_grid(
 # ---------------------------------------------------------------------------#
 # carve_circle_grid – subtract a grid of circles from the part #
 # ---------------------------------------------------------------------------#
-# Each circle is centred at Z depth so that 2 mm of material remains.
+# Each circle is centred at Z depth so that min_border mm of material remains.
 # ---------------------------------------------------------------------------#
 def carve_circle_grid(
     part,
@@ -155,6 +155,7 @@ def carve_circle_grid(
     count: Optional[int],
     is_inner: bool,
     custom_depth: Optional[float] = None,
+    min_border: float = 2.0,
 ):
     from build123d import (
         BuildPart,
@@ -167,9 +168,9 @@ def carve_circle_grid(
     )
 
     bbox = part.bounding_box()
-    part_x = bbox.size.X - 2 * 2.0  # leave outer 2 mm shell untouched
-    part_y = bbox.size.Y - 2 * 2.0
-    cols, rows, sx, sy = best_circle_grid(part_x, part_y, radius, 2.0, count)
+    part_x = bbox.size.X - 2 * min_border  # leave outer border shell untouched
+    part_y = bbox.size.Y - 2 * min_border
+    cols, rows, sx, sy = best_circle_grid(part_x, part_y, radius, min_border, count)
     # left/bottom offset so first spacing margin included
     diameter = 2 * radius
     start_x = bbox.center().X - (cols - 1) * (diameter + sx) / 2
@@ -177,17 +178,18 @@ def carve_circle_grid(
     # depth calculation
     if custom_depth is not None:
         depth = custom_depth
-        if depth > bbox.size.Z - 2.0:
+        if depth > bbox.size.Z - min_border:
             raise RuntimeError(
-                f"Custom depth {depth}mm exceeds maximum allowed depth {bbox.size.Z - 2.0}mm"
+                f"Custom depth {depth}mm exceeds maximum allowed depth {bbox.size.Z - min_border}mm"
             )
     else:
-        depth = bbox.size.Z - 2.0
+        depth = bbox.size.Z - min_border
 
     if depth <= 0:
         raise RuntimeError("Computed depth ≤0 – part too shallow for cut‑out")
     print(f"Circle cutter depth: {depth:.2f} mm")
     print(f"Circle radius: {radius:.2f} mm")
+    print(f"Using border: {min_border:.2f} mm")
     cutters = []
     for r in range(rows):
         cy = start_y + r * (diameter + sy)
@@ -214,7 +216,7 @@ def carve_circle_grid(
 # ---------------------------------------------------------------------------#
 # carve_rect_grid – subtract a grid of rectangles from the part #
 # ---------------------------------------------------------------------------#
-# Each rectangle is centred at Z depth so that 2 mm of material remains.
+# Each rectangle is centred at Z depth so that min_border mm of material remains.
 # If round_bottom is True, creates a curved bottom along the longest dimension.
 # ---------------------------------------------------------------------------#
 def carve_rect_grid(
@@ -226,6 +228,7 @@ def carve_rect_grid(
     fillet_radius: float = 0.0,
     round_bottom: bool = False,
     custom_depth: Optional[float] = None,
+    min_border: float = 2.0,
 ):
     from build123d import (
         BuildPart,
@@ -245,10 +248,10 @@ def carve_rect_grid(
     import math
 
     bbox = part.bounding_box()
-    part_x = bbox.size.X - 2 * MIN_SPACING_MM  # leave outer 2 mm shell untouched
-    part_y = bbox.size.Y - 2 * MIN_SPACING_MM
+    part_x = bbox.size.X - 2 * min_border  # leave outer border shell untouched
+    part_y = bbox.size.Y - 2 * min_border
     cols, rows, sx, sy = best_grid(
-        part_x, part_y, rect_x, rect_y, MIN_SPACING_MM, count
+        part_x, part_y, rect_x, rect_y, min_border, count
     )
     # left/bottom offset so first spacing margin included
     start_x = bbox.center().X - (cols - 1) * (rect_x + sx) / 2
@@ -256,16 +259,17 @@ def carve_rect_grid(
     # depth calculation
     if custom_depth is not None:
         depth = custom_depth
-        if depth > bbox.size.Z - 2.0:
+        if depth > bbox.size.Z - min_border:
             raise RuntimeError(
-                f"Custom depth {depth}mm exceeds maximum allowed depth {bbox.size.Z - 2.0}mm"
+                f"Custom depth {depth}mm exceeds maximum allowed depth {bbox.size.Z - min_border}mm"
             )
     else:
-        depth = bbox.size.Z - 2.0
+        depth = bbox.size.Z - min_border
 
     if depth <= 0:
         raise RuntimeError("Computed depth ≤0 – part too shallow for cut‑out")
     print(f"Cutter depth: {depth:.2f} mm")
+    print(f"Using border: {min_border:.2f} mm")
     if fillet_radius > 0:
         print(f"Using fillet radius: {fillet_radius:.2f} mm")
     if round_bottom:
@@ -1042,7 +1046,7 @@ def main():
     cli.add_argument(
         "--cutout_depth",
         type=float,
-        help="Custom depth for cutouts in mm (default: part height - 2mm)",
+        help="Custom depth for cutouts in mm (default: part height - border)",
     )
     # Circular cut‑outs
     cli.add_argument(
@@ -1051,37 +1055,57 @@ def main():
         help="Radius for circular cut‑outs in mm",
     )
     cli.add_argument(
+        "--cut_diameter",
+        type=float,
+        help="Diameter for circular cut‑outs in mm (alternative to cutout_radius)",
+    )
+    cli.add_argument(
+        "--min_border",
+        type=float,
+        default=2.0,
+        help="Minimum border/shell thickness around cutouts in mm (default: 2.0)",
+    )
+    cli.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug output and visualizations",
     )
     args = cli.parse_args()
+    
     # Validate arguments
     if args.solid and args.inner:
         cli.error("--solid and --inner cannot be used together")
     if args.solid and (
-        args.cutout or (args.cut_x and args.cut_y) or args.cutout_radius
+        args.cutout or (args.cut_x and args.cut_y) or args.cutout_radius or args.cut_diameter
     ):
         cli.error(
-            "--solid cannot be used with cutouts (--cutout, --cut_x/--cut_y, --cutout_radius)"
+            "--solid cannot be used with cutouts (--cutout, --cut_x/--cut_y, --cutout_radius, --cut_diameter)"
         )
-    if (args.cut_x and args.cut_y) and args.cutout_radius:
+    if (args.cut_x and args.cut_y) and (args.cutout_radius or args.cut_diameter):
         cli.error(
-            "Cannot use both rectangular (--cut_x/--cut_y) and circular (--cutout_radius) cutouts together"
+            "Cannot use both rectangular (--cut_x/--cut_y) and circular (--cutout_radius/--cut_diameter) cutouts together"
         )
     if (args.cut_x and not args.cut_y) or (args.cut_y and not args.cut_x):
         cli.error("Both --cut_x and --cut_y must be specified for rectangular cutouts")
+    if args.cutout_radius and args.cut_diameter:
+        cli.error("Cannot specify both --cutout_radius and --cut_diameter")
 
     if args.cut_round and not (args.cut_x and args.cut_y):
         cli.error("--cut_round requires rectangular cutouts (--cut_x and --cut_y)")
 
-    if args.cut_round and args.cutout_radius:
+    if args.cut_round and (args.cutout_radius or args.cut_diameter):
         cli.error("--cut_round only works with rectangular cutouts, not circular")
 
     if args.cut_round and args.cut_fillet != 10.0:
         cli.error(
             "--cut_round cannot be used with --cut_fillet (rounded bottoms don't support filleted corners)"
         )
+
+    # Convert cut_diameter to cutout_radius if specified
+    if args.cut_diameter:
+        args.cutout_radius = args.cut_diameter / 2.0
+        print(f"Converting diameter {args.cut_diameter}mm to radius {args.cutout_radius}mm")
+
     # Create shape matrix from x and y dimensions
     shape = create_shape(args.x, args.y)
     base = f"gridfinity_{args.x}x{args.y}"
@@ -1105,13 +1129,19 @@ def main():
         if args.cut_round:
             filename_parts.append("round")
     if args.cutout_radius:
-        filename_parts.append(f"r{args.cutout_radius}")
+        if args.cut_diameter:
+            filename_parts.append(f"d{args.cut_diameter}")
+        else:
+            filename_parts.append(f"r{args.cutout_radius}")
         if args.cut_count:
             filename_parts.append(f"n{args.cut_count}")
     if args.cutout_depth:
-        filename_parts.append(f"d{args.cutout_depth}")
+        filename_parts.append(f"depth{args.cutout_depth}")
+    if args.min_border != 2.0:
+        filename_parts.append(f"border{args.min_border}")
     outfile = "_".join(filename_parts) + ".stl"
     print(f"\nOutput file will be: {outfile}")
+    
     # Check if we need to carve cutouts or create solid fill
     has_cutouts = (
         args.cutout or (args.cut_x and args.cut_y) or args.cutout_radius or args.solid
@@ -1125,6 +1155,7 @@ def main():
         export_stl(bin, outfile)
         print("Exported bin:", outfile)
         return
+
     # Start with solid plug
     print(f"\nCreating plug/insert...")
     tol = TOLERANCE_MM if args.inner else 0.0
@@ -1140,14 +1171,14 @@ def main():
             plug_bbox = plug.bounding_box()
             if args.cutout_depth:
                 depth = args.cutout_depth
-                max_depth = plug_bbox.size.Z - 2.0
+                max_depth = plug_bbox.size.Z - args.min_border
                 if depth > max_depth:
                     print(
                         f"Warning: Requested depth {depth}mm exceeds maximum {max_depth}mm, using maximum"
                     )
                     depth = max_depth
             else:
-                depth = plug_bbox.size.Z - 2.0  # Leave 2mm at bottom
+                depth = plug_bbox.size.Z - args.min_border  # Leave border at bottom
             plug = carve_plug(
                 plug,
                 contour,
@@ -1168,6 +1199,7 @@ def main():
                 args.cut_fillet,
                 round_bottom=args.cut_round,
                 custom_depth=args.cutout_depth,
+                min_border=args.min_border,
             )
 
         # Circular cut‑out grid
@@ -1178,6 +1210,7 @@ def main():
                 args.cut_count,
                 args.inner,
                 custom_depth=args.cutout_depth,
+                min_border=args.min_border,
             )
     else:
         print("Creating solid-filled bin (no cutouts)")
