@@ -67,3 +67,7 @@ To use the script, run it from the command line with the desired arguments.
 ## Output
 
 The script generates an STL file that can be 3D printed. The filename is based on the shape and height specified, and includes the cutout name if the `--cutout` option is used.
+
+## License
+
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev) - free to use and modify, but no commercial use without permission.
